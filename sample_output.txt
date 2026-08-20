@@ -1,0 +1,37 @@
+==============================================================================
+STAFFING RECOMMENDATION REPORT
+==============================================================================
+Input file: /mnt/user-data/uploads/RevI-Test.csv
+Months of history: 81
+Forecast horizon: 6 months
+Business parameters: salary=3.0/person/month, commission_rate=5%, margin_rate=50%
+
+Current active staff: 7
+  - sale sp8: employed since month 20 (62 months tenure)
+  - sale sp10: employed since month 35 (47 months tenure)
+  - sale sp12: employed since month 46 (36 months tenure)
+  - sale sp13: employed since month 57 (25 months tenure)
+  - sale sp14: employed since month 62 (20 months tenure)
+  - sale sp15: employed since month 66 (16 months tenure)
+  - sale sp16: employed since month 76 (6 months tenure)
+
+Most recent departure: sale sp9 (employed months 30-76, 47 months tenure, left 5 month(s) ago)
+
+------------------------------------------------------------------------------
+PROJECTED 6-MONTH GROSS MARGIN BY SCENARIO
+------------------------------------------------------------------------------
+Scenario                              Expected Gross Margin
+Remain at current staffing level                    196.56
+Hire replacement immediately                        202.75
+Delay hiring by 1 month(s)                          200.36
+Delay hiring by 2 month(s)                          198.26
+Delay hiring by 3 month(s)                          196.44
+
+------------------------------------------------------------------------------
+RECOMMENDATION
+------------------------------------------------------------------------------
+Hire replacement immediately is expected to produce the highest gross margin over the next 6 months: approximately 202.75, compared to 196.56 if staffing is left unchanged (+6.19, about 3.1%).
+
+This recommendation reflects this dataset's specific recent seasonal position and current staff tenure. It is not a general rule -- re-run this analysis whenever staffing changes are being considered, since the right timing depends on where the next few months fall in the seasonal cycle and how experienced the remaining staff currently are.
+
+==============================================================================
