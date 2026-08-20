@@ -376,3 +376,255 @@ def fallback_recent_average_productivity(df, sp_cols, tenures, lookback=3):
             first_month_values.append(s.iloc[0])
     start_productivity = min(first_month_values) if first_month_values else 0.0
     return start_productivity
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def format_report(
+    csv_path,
+    df,
+    sp_cols,
+    tenures,
+    last_month_in_data,
+    departed_staff,
+    used_fallback,
+    ramp_params,
+    seasonal_mult,
+    scenarios,
+    current_headcount,
+    horizon,
+    salary,
+    commission_rate,
+    margin_rate,
+):
+    lines = []
+    add = lines.append
+
+    add("=" * 78)
+    add("STAFFING RECOMMENDATION REPORT")
+    add("=" * 78)
+    add(f"Input file: {csv_path}")
+    add(f"Months of history: {last_month_in_data}")
+    add(f"Forecast horizon: {horizon} months")
+    add(
+        f"Business parameters: salary={salary}/person/month, "
+        f"commission_rate={commission_rate:.0%}, margin_rate={margin_rate:.0%}"
+    )
+    add("")
+
+    active = {c: t for c, t in tenures.items() if t["currently_active"]}
+    add(f"Current active staff: {len(active)}")
+    for c, t in sorted(active.items(), key=lambda kv: kv[1]["first"]):
+        tenure_months = last_month_in_data - t["first"] + 1
+        add(f"  - {c}: employed since month {t['first']} ({tenure_months} months tenure)")
+    add("")
+
+    if departed_staff:
+        t = tenures[departed_staff]
+        add(
+            f"Most recent departure: {departed_staff} "
+            f"(employed months {t['first']}-{t['last']}, {t['n_months']} months tenure, "
+            f"left {last_month_in_data - t['last']} month(s) ago)"
+        )
+    else:
+        add("No departure detected in the data (or none specified). "
+            "This report evaluates whether to ADD a salesperson beyond current headcount.")
+    add("")
+
+    if used_fallback:
+        add("-" * 78)
+        add("NOTE ON DATA SUFFICIENCY")
+        add("-" * 78)
+        add(
+            f"This dataset has only {last_month_in_data} months of history, which is below "
+            f"the {MIN_MONTHS_FOR_MODEL}-month threshold this tool uses to trust a fitted "
+            "ramp-up curve and a 12-month seasonal pattern. Both require enough repeated "
+            "observations (multiple full hire-to-veteran journeys, multiple full yearly "
+            "cycles) to estimate reliably; with limited data they would likely overfit "
+            "noise rather than capture real patterns."
+        )
+        add(
+            "This report instead uses each active salesperson's own recent average sales, "
+            "and a conservative estimate of new-hire starting productivity based on the "
+            "weakest first-month performance seen in the data. Treat this recommendation "
+            "as directional rather than precise, and revisit it once more months of data "
+            "are available."
+        )
+        add("")
+
+    add("-" * 78)
+    add(f"PROJECTED {horizon}-MONTH GROSS MARGIN BY SCENARIO")
+    add("-" * 78)
+
+    name_map = {"stay_as_is": "Remain at current staffing level"}
+    for key in scenarios:
+        if key.startswith("delay_"):
+            d = key.split("_")[1]
+            name_map[key] = f"Delay hiring by {d} month(s)"
+    name_map["hire_now"] = "Hire replacement immediately"
+
+    ordered_keys = ["stay_as_is", "hire_now"] + sorted(
+        [k for k in scenarios if k.startswith("delay_")],
+        key=lambda k: int(k.split("_")[1]),
+    )
+
+    col_w = 38
+    add(f"{'Scenario':<{col_w}}{'Expected Gross Margin':>20}")
+    for key in ordered_keys:
+        if key not in scenarios:
+            continue
+        label = name_map.get(key, key)
+        margin = scenarios[key]["total_margin"]
+        add(f"{label:<{col_w}}{margin:>20.2f}")
+    add("")
+
+    best_key = max(scenarios, key=lambda k: scenarios[k]["total_margin"])
+    best_margin = scenarios[best_key]["total_margin"]
+    baseline_margin = scenarios["stay_as_is"]["total_margin"]
+    improvement = best_margin - baseline_margin
+    pct_improvement = (improvement / abs(baseline_margin) * 100) if baseline_margin != 0 else float("nan")
+
+    add("-" * 78)
+    add("RECOMMENDATION")
+    add("-" * 78)
+    if best_key == "stay_as_is":
+        add(
+            "Do NOT hire a replacement right now. Based on the projected ramp-up of a new "
+            "hire and the expected seasonal pattern over the next "
+            f"{horizon} months, staying at {current_headcount} staff is expected to produce "
+            "the highest gross margin of the scenarios tested."
+        )
+    else:
+        add(
+            f"{name_map.get(best_key, best_key)} is expected to produce the highest gross "
+            f"margin over the next {horizon} months: approximately {best_margin:.2f}, "
+            f"compared to {baseline_margin:.2f} if staffing is left unchanged "
+            f"(+{improvement:.2f}, about {pct_improvement:.1f}%)."
+        )
+    add("")
+    add(
+        "This recommendation reflects this dataset's specific recent seasonal position and "
+        "current staff tenure. It is not a general rule -- re-run this analysis whenever "
+        "staffing changes are being considered, since the right timing depends on where the "
+        "next few months fall in the seasonal cycle and how experienced the remaining staff "
+        "currently are."
+    )
+    add("")
+    add("=" * 78)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Analyze monthly sales-by-salesperson data and recommend "
+        "whether to hire a replacement salesperson, and when."
+    )
+    parser.add_argument("csv_path", help="Path to the input CSV file.")
+    parser.add_argument(
+        "--salary", type=float, default=3.0,
+        help="Salary cost per salesperson per month, in the same units as the Sales "
+        "column (default: 3.0, matching the example dataset).",
+    )
+    parser.add_argument(
+        "--commission-rate", type=float, default=0.05,
+        help="Commission as a fraction of sales, e.g. 0.05 for 5%% (default: 0.05).",
+    )
+    parser.add_argument(
+        "--margin-rate", type=float, default=0.50,
+        help="Gross margin as a fraction of sales, e.g. 0.50 for 50%% (default: 0.50).",
+    )
+    parser.add_argument(
+        "--horizon", type=int, default=6,
+        help="Number of months ahead to forecast (default: 6).",
+    )
+    parser.add_argument(
+        "--departed-staff", type=str, default=None,
+        help="Column name of a specific salesperson to evaluate as 'departed' "
+        "(e.g. 'sale sp9'), overriding auto-detection of the most recent departure.",
+    )
+    parser.add_argument(
+        "--output", type=str, default=None,
+        help="Path to save the text report (default: <input_filename>_report.txt).",
+    )
+    args = parser.parse_args()
+
+    try:
+        df, sp_cols = load_data(args.csv_path)
+    except Exception as e:
+        print(f"Error reading input file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    tenures, last_month_in_data = get_staff_tenures(df, sp_cols)
+
+    if args.departed_staff:
+        if args.departed_staff not in tenures:
+            print(
+                f"Error: '{args.departed_staff}' not found among detected salesperson "
+                f"columns: {list(tenures.keys())}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        departed_staff = args.departed_staff
+    else:
+        departed_staff = detect_most_recent_departure(tenures, last_month_in_data)
+
+    used_fallback = last_month_in_data < MIN_MONTHS_FOR_MODEL
+
+    ramp_params = None
+    if not used_fallback:
+        tenure_df = build_tenure_table(df, sp_cols)
+        n_hires = tenure_df["salesperson"].nunique()
+        seasonal_mult, _ = estimate_seasonality(df)
+        if n_hires >= MIN_HIRES_FOR_RAMP:
+            ramp_params = fit_ramp_curve(tenure_df, seasonal_mult)
+        if ramp_params is None:
+            # not enough distinct hires to fit a ramp curve reliably, or fit failed;
+            # fall back even though there's plenty of *time* history
+            used_fallback = True
+
+    if used_fallback:
+        seasonal_mult, _ = estimate_seasonality(df) if last_month_in_data >= 12 else (
+            {i: 1.0 for i in range(12)}, df["Sales"].mean()
+        )
+        start_productivity = fallback_recent_average_productivity(df, sp_cols, tenures)
+        seasonal_mult["fallback_start_productivity"] = start_productivity
+
+    scenarios, current_headcount = project_scenarios(
+        df, sp_cols, tenures, last_month_in_data, ramp_params, seasonal_mult,
+        args.horizon, args.salary, args.commission_rate, args.margin_rate,
+    )
+
+    report = format_report(
+        args.csv_path, df, sp_cols, tenures, last_month_in_data, departed_staff,
+        used_fallback, ramp_params, seasonal_mult, scenarios, current_headcount,
+        args.horizon, args.salary, args.commission_rate, args.margin_rate,
+    )
+
+    print(report)
+
+    output_path = args.output
+    if output_path is None:
+        import os
+        base = os.path.basename(args.csv_path).rsplit(".", 1)[0]
+        output_path = f"{base}_report.txt"
+    try:
+        with open(output_path, "w") as f:
+            f.write(report)
+        print(f"\n(Report saved to {output_path})")
+    except OSError as e:
+        print(
+            f"\n(Could not save report to {output_path}: {e}. "
+            "Use --output to specify a writable location.)",
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    main()
