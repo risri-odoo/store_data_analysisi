@@ -182,3 +182,60 @@ def build_tenure_table(df, sp_cols):
                 {"salesperson": c, "tenure_month": t, "sales": v, "calendar_month": cm}
             )
     return pd.DataFrame(records)
+
+
+def estimate_seasonality(df, cycle_length=12):
+    """
+    Estimate a multiplicative seasonal index by position in a 12-month
+    cycle, based on total store Sales. Returns a dict {0..11: multiplier}
+    where multiplier=1.0 means "average month".
+    """
+    tmp = df[["Month", "Sales"]].copy()
+    tmp["cyc"] = (tmp["Month"] - 1) % cycle_length
+    seasonal_avg = tmp.groupby("cyc")["Sales"].mean()
+    overall_mean = tmp["Sales"].mean()
+    seasonal_mult = (seasonal_avg / overall_mean).to_dict()
+    # fill any missing cycle positions (possible with very short history) with 1.0
+    for i in range(cycle_length):
+        seasonal_mult.setdefault(i, 1.0)
+    return seasonal_mult, overall_mean
+
+
+def fit_ramp_curve(tenure_df, seasonal_mult, cycle_length=12):
+    """
+    Fit a saturating ramp-up curve: deseasonalized_sales(tenure_month) =
+        B + A * (1 - exp(-k * tenure_month))
+    where B = approximate starting productivity, A+B = approximate
+    long-run plateau productivity, k = ramp speed.
+
+    Deseasonalizes each observation first so that the curve reflects
+    tenure-driven growth, not calendar-driven seasonal swings.
+    """
+    df = tenure_df.copy()
+    df["cyc"] = (df["calendar_month"] - 1) % cycle_length
+    df["seasonal_mult"] = df["cyc"].map(seasonal_mult)
+    df["sales_deseasonalized"] = df["sales"] / df["seasonal_mult"].replace(0, np.nan)
+    df = df.dropna(subset=["sales_deseasonalized"])
+
+    def model(t, A, k, B):
+        return B + A * (1 - np.exp(-k * t))
+
+    x = df["tenure_month"].values.astype(float)
+    y = df["sales_deseasonalized"].values.astype(float)
+
+    # reasonable starting guesses: B ~ low end of observed sales, A ~ spread, k small
+    p0 = [max(y.max() - y.min(), 1.0), 0.05, max(y.min(), 0.1)]
+    try:
+        popt, _ = curve_fit(model, x, y, p0=p0, maxfev=20000)
+        A, k, B = popt
+        # guard against degenerate fits (negative ramp speed, absurd plateau)
+        if k <= 0 or A < 0:
+            return None
+        return {"A": A, "k": k, "B": B, "model": model}
+    except Exception:
+        return None
+
+
+def ramp_value(ramp_params, tenure_month):
+    """Predicted deseasonalized productivity at a given tenure month."""
+    return ramp_params["model"](tenure_month, ramp_params["A"], ramp_params["k"], ramp_params["B"])
