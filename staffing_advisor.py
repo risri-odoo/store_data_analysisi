@@ -349,3 +349,30 @@ def project_scenarios(
         }
 
     return scenarios, current_headcount
+
+
+# ---------------------------------------------------------------------------
+# Fallback path for short histories
+# ---------------------------------------------------------------------------
+
+def fallback_recent_average_productivity(df, sp_cols, tenures, lookback=3):
+    """
+    For shops with too little history to fit a ramp curve reliably, estimate
+    each active salesperson's "recent average sales" using their last
+    `lookback` active months, and estimate a typical new-hire starting
+    productivity as the minimum first-month sales seen among any past hires
+    (or, if no past hires exist at all, the minimum of any active person's
+    earliest observed sales).
+    """
+    for c, t in tenures.items():
+        s = df[df[c] > 0][c]
+        recent = s.tail(lookback)
+        t["recent_avg_sales"] = recent.mean() if len(recent) > 0 else s.mean()
+
+    first_month_values = []
+    for c in sp_cols:
+        s = df[df[c] > 0][c]
+        if len(s) > 0:
+            first_month_values.append(s.iloc[0])
+    start_productivity = min(first_month_values) if first_month_values else 0.0
+    return start_productivity
