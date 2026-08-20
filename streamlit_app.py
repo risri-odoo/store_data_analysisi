@@ -32,6 +32,18 @@ from staffing_advisor import (
 st.set_page_config(page_title="RevInsight Staffing Advisor", layout="wide")
 
 SCENARIO_LABELS = {"stay_as_is": "Remain at current staffing level", "hire_now": "Hire replacement immediately"}
+SCENARIO_SHORT_LABELS = {"stay_as_is": "Stay as-is", "hire_now": "Hire now"}
+
+# Fixed categorical colors, one per scenario identity (never reassigned by rank/rerun).
+# Order follows the validated dataviz palette's adjacent-pairlist slot sequence.
+SCENARIO_COLORS = {
+    "stay_as_is": "#2a78d6",       # blue
+    "hire_now": "#eb6834",         # orange
+    "delay_1_months": "#1baf7a",   # aqua
+    "delay_2_months": "#eda100",   # yellow
+    "delay_3_months": "#e87ba4",   # magenta
+}
+HIGHLIGHT_BG = "rgba(12, 163, 12, 0.18)"  # soft wash of the palette's "good" status hue
 
 
 def scenario_label(key):
@@ -43,8 +55,32 @@ def scenario_label(key):
     return key
 
 
-def run_analysis(df, sp_cols, horizon, salary, commission_rate, margin_rate):
-    """Mirrors the model-selection logic in staffing_advisor.main()."""
+def scenario_short_label(key):
+    """Compact label for space-constrained widgets like st.metric."""
+    if key in SCENARIO_SHORT_LABELS:
+        return SCENARIO_SHORT_LABELS[key]
+    if key.startswith("delay_"):
+        d = key.split("_")[1]
+        return f"Delay {d} mo"
+    return scenario_label(key)
+
+
+@st.cache_resource(show_spinner="Parsing data and fitting model...")
+def analyze_file(uploaded_file):
+    """
+    Everything that depends only on the uploaded data, not on the business
+    parameters: CSV parsing, tenure detection, and (if there's enough
+    history) fitting the ramp-up curve and seasonality model. Cached so that
+    adjusting salary/commission/margin/horizon in the sidebar never re-parses
+    the file or re-fits the curve -- only the cheap scenario projection below
+    reruns. Mirrors the model-selection logic in staffing_advisor.main().
+
+    Uses cache_resource (cache by reference) rather than cache_data (cache by
+    pickled value): fit_ramp_curve() returns a dict holding a local closure
+    (its `model` function), which isn't picklable, so cache_data would fail
+    on any dataset with enough history to fit the ramp curve.
+    """
+    df, sp_cols = load_data(uploaded_file)
     tenures, last_month_in_data = get_staff_tenures(df, sp_cols)
     departed_staff = detect_most_recent_departure(tenures, last_month_in_data)
 
@@ -68,18 +104,15 @@ def run_analysis(df, sp_cols, horizon, salary, commission_rate, margin_rate):
         start_productivity = fallback_recent_average_productivity(df, sp_cols, tenures)
         seasonal_mult["fallback_start_productivity"] = start_productivity
 
-    scenarios, current_headcount = project_scenarios(
-        df, sp_cols, tenures, last_month_in_data, ramp_params, seasonal_mult,
-        horizon, salary, commission_rate, margin_rate,
-    )
-
     return {
+        "df": df,
+        "sp_cols": sp_cols,
         "tenures": tenures,
         "last_month_in_data": last_month_in_data,
         "departed_staff": departed_staff,
         "used_fallback": used_fallback,
-        "scenarios": scenarios,
-        "current_headcount": current_headcount,
+        "ramp_params": ramp_params,
+        "seasonal_mult": seasonal_mult,
     }
 
 
@@ -115,19 +148,25 @@ if uploaded_file is None:
     st.stop()
 
 try:
-    df, sp_cols = load_data(uploaded_file)
+    analysis = analyze_file(uploaded_file)
 except Exception as e:
     st.error(f"Could not read the uploaded file: {e}")
     st.stop()
 
-result = run_analysis(df, sp_cols, horizon, salary, commission_rate, margin_rate)
+df = analysis["df"]
+sp_cols = analysis["sp_cols"]
+tenures = analysis["tenures"]
+last_month_in_data = analysis["last_month_in_data"]
+departed_staff = analysis["departed_staff"]
+used_fallback = analysis["used_fallback"]
+ramp_params = analysis["ramp_params"]
+seasonal_mult = analysis["seasonal_mult"]
 
-tenures = result["tenures"]
-last_month_in_data = result["last_month_in_data"]
-departed_staff = result["departed_staff"]
-used_fallback = result["used_fallback"]
-scenarios = result["scenarios"]
-current_headcount = result["current_headcount"]
+# Cheap: reruns on every parameter change without re-parsing or re-fitting.
+scenarios, current_headcount = project_scenarios(
+    df, sp_cols, tenures, last_month_in_data, ramp_params, seasonal_mult,
+    horizon, salary, commission_rate, margin_rate,
+)
 
 if used_fallback:
     st.warning(
@@ -146,6 +185,34 @@ else:
         "ramp-up curve and 12-month seasonality model.",
         icon="✅",
     )
+
+ordered_keys = ["stay_as_is", "hire_now"] + sorted(
+    [k for k in scenarios if k.startswith("delay_")],
+    key=lambda k: int(k.split("_")[1]),
+)
+
+best_key = max(scenarios, key=lambda k: scenarios[k]["total_margin"])
+worst_key = min(scenarios, key=lambda k: scenarios[k]["total_margin"])
+best_margin = scenarios[best_key]["total_margin"]
+worst_margin = scenarios[worst_key]["total_margin"]
+baseline_margin = scenarios["stay_as_is"]["total_margin"]
+improvement = best_margin - baseline_margin
+pct_improvement = (improvement / abs(baseline_margin) * 100) if baseline_margin != 0 else float("nan")
+
+# --- At-a-glance summary -----------------------------------------------
+m1, m2, m3 = st.columns(3)
+m1.metric("Recommended action", scenario_short_label(best_key), help=scenario_label(best_key))
+m2.metric(
+    "Projected gross margin",
+    f"{best_margin:,.2f}",
+    delta=f"{improvement:+,.2f} vs. staying as-is",
+)
+m3.metric(
+    "Best vs. worst scenario",
+    f"{best_margin - worst_margin:,.2f}",
+    help=f"Gap between '{scenario_label(best_key)}' and '{scenario_label(worst_key)}', the "
+    "widest spread among the scenarios tested.",
+)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -170,10 +237,6 @@ with col2:
 
 st.subheader(f"Projected {horizon}-month gross margin by scenario")
 
-ordered_keys = ["stay_as_is", "hire_now"] + sorted(
-    [k for k in scenarios if k.startswith("delay_")],
-    key=lambda k: int(k.split("_")[1]),
-)
 table_df = pd.DataFrame(
     [
         {
@@ -185,31 +248,47 @@ table_df = pd.DataFrame(
     ]
 ).sort_values("Expected Gross Margin", ascending=False).reset_index(drop=True)
 
-st.dataframe(table_df, use_container_width=True, hide_index=True)
+best_label = scenario_label(best_key)
 
+
+def highlight_best_row(row):
+    style = f"background-color: {HIGHLIGHT_BG}" if row["Scenario"] == best_label else ""
+    return [style] * len(row)
+
+
+st.dataframe(
+    table_df.style.apply(highlight_best_row, axis=1).format({"Expected Gross Margin": "{:,.2f}"}),
+    use_container_width=True,
+    hide_index=True,
+)
+st.caption(f"Highlighted row: **{best_label}**, the highest-margin scenario tested.")
+
+# --- Chart ---------------------------------------------------------------
 fig = go.Figure()
 for key in ordered_keys:
+    is_best = key == best_key
+    color = SCENARIO_COLORS.get(key, "#898781")
     fig.add_trace(
         go.Scatter(
             x=list(range(1, horizon + 1)),
             y=scenarios[key]["monthly_margin"],
             mode="lines+markers",
-            name=scenario_label(key),
+            name=scenario_label(key) + (" (recommended)" if is_best else ""),
+            line=dict(color=color, width=4 if is_best else 1.75),
+            marker=dict(color=color, size=9 if is_best else 5),
+            opacity=1.0 if is_best else 0.35,
         )
     )
 fig.update_layout(
     xaxis_title="Month ahead",
     yaxis_title="Projected gross margin",
-    legend_title="Scenario",
     hovermode="x unified",
+    height=560,
+    font=dict(size=14),
+    legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="left", x=0),
+    margin=dict(t=80),
 )
 st.plotly_chart(fig, use_container_width=True)
-
-best_key = max(scenarios, key=lambda k: scenarios[k]["total_margin"])
-best_margin = scenarios[best_key]["total_margin"]
-baseline_margin = scenarios["stay_as_is"]["total_margin"]
-improvement = best_margin - baseline_margin
-pct_improvement = (improvement / abs(baseline_margin) * 100) if baseline_margin != 0 else float("nan")
 
 st.subheader("Recommendation")
 if best_key == "stay_as_is":
