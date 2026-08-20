@@ -239,3 +239,113 @@ def fit_ramp_curve(tenure_df, seasonal_mult, cycle_length=12):
 def ramp_value(ramp_params, tenure_month):
     """Predicted deseasonalized productivity at a given tenure month."""
     return ramp_params["model"](tenure_month, ramp_params["A"], ramp_params["k"], ramp_params["B"])
+
+
+# ---------------------------------------------------------------------------
+# Margin model and scenario simulation
+# ---------------------------------------------------------------------------
+
+def margin_from_sales(total_sales, headcount, salary, commission_rate, margin_rate):
+    gross = margin_rate * total_sales
+    salaries = salary * headcount
+    commission = commission_rate * total_sales
+    return gross - salaries - commission
+
+
+def project_scenarios(
+    df,
+    sp_cols,
+    tenures,
+    last_month_in_data,
+    ramp_params,
+    seasonal_mult,
+    horizon,
+    salary,
+    commission_rate,
+    margin_rate,
+    cycle_length=12,
+):
+    """
+    Runs the core comparison:
+      - "stay": keep current active staff, no new hire, over the horizon
+      - "hire_now": add one new hire starting next month
+      - "delay_D": add one new hire starting D months from now, for D in 1..min(3, horizon-1)
+
+    For each scenario, projects month-by-month sales of existing staff
+    using the ramp curve at their *future* tenure, applies seasonal
+    multipliers for each future calendar month, sums to a total monthly
+    sales figure, and computes margin.
+
+    Returns a dict of scenario_name -> {"total_margin": x, "monthly": [...]}
+    """
+    active_staff = {c: t for c, t in tenures.items() if t["currently_active"]}
+    current_headcount = len(active_staff)
+
+    future_months = [last_month_in_data + i for i in range(1, horizon + 1)]
+    future_cyc = [(m - 1) % cycle_length for m in future_months]
+    future_seasonal_factors = [seasonal_mult.get(c, 1.0) for c in future_cyc]
+
+    def existing_staff_sales(month_offset, seasonal_factor):
+        """Projected total sales from current staff at a future month offset (1..horizon)."""
+        total = 0.0
+        for col, t in active_staff.items():
+            tenure_so_far = last_month_in_data - t["first"] + 1
+            future_tenure = tenure_so_far + month_offset
+            if ramp_params is not None:
+                total += ramp_value(ramp_params, future_tenure) * seasonal_factor
+            else:
+                # fallback: use this person's own recent average sales, scaled by
+                # seasonal factor relative to the average seasonal factor (~1.0)
+                total += t["recent_avg_sales"] * seasonal_factor
+        return total
+
+    scenarios = {}
+
+    # Scenario: stay as-is
+    monthly = []
+    for off in range(1, horizon + 1):
+        f = future_seasonal_factors[off - 1]
+        s = existing_staff_sales(off, f)
+        monthly.append(s)
+    margins = [
+        margin_from_sales(s, current_headcount, salary, commission_rate, margin_rate)
+        for s in monthly
+    ]
+    scenarios["stay_as_is"] = {
+        "headcount_after": current_headcount,
+        "monthly_sales": monthly,
+        "monthly_margin": margins,
+        "total_margin": sum(margins),
+    }
+
+    # Scenario: hire immediately, and delayed hiring by D months
+    max_delay = min(3, horizon - 1) if horizon > 1 else 0
+    for D in [0] + list(range(1, max_delay + 1)):
+        monthly = []
+        for off in range(1, horizon + 1):
+            f = future_seasonal_factors[off - 1]
+            s = existing_staff_sales(off, f)
+            if off > D:
+                new_hire_tenure = off - D
+                if ramp_params is not None:
+                    s += ramp_value(ramp_params, new_hire_tenure) * f
+                else:
+                    # fallback: assume new hire starts at the lowest historical
+                    # starting productivity observed, scaled by season
+                    s += seasonal_mult.get("fallback_start_productivity", 0) * f
+                headcount = current_headcount + 1
+            else:
+                headcount = current_headcount
+            monthly.append((s, headcount))
+        margins = [
+            margin_from_sales(s, hc, salary, commission_rate, margin_rate) for s, hc in monthly
+        ]
+        key = "hire_now" if D == 0 else f"delay_{D}_months"
+        scenarios[key] = {
+            "headcount_after": current_headcount + 1,
+            "monthly_sales": [m[0] for m in monthly],
+            "monthly_margin": margins,
+            "total_margin": sum(margins),
+        }
+
+    return scenarios, current_headcount
